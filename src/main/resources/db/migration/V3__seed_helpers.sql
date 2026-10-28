@@ -1,0 +1,2 @@
+-- Seed is implemented by the application CommandLineRunner so the reviewer can
+-- control the row count with SEED_COUNT without making the migration itself huge.

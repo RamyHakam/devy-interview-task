@@ -1,0 +1,11 @@
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/spend}
+    username: ${SPRING_DATASOURCE_USERNAME:spend}
+    password: ${SPRING_DATASOURCE_PASSWORD:spend}
+  flyway:
+    enabled: true
+server:
+  tomcat:
+    threads:
+      max: 100
