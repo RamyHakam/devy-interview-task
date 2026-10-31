@@ -1,31 +1,13 @@
 services:
   postgres:
-    image: postgres:17
+    image: postgres:16
     environment:
-      POSTGRES_DB: spend
-      POSTGRES_USER: spend
-      POSTGRES_PASSWORD: spend
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+      POSTGRES_DB: quotes
+      POSTGRES_USER: quotes
+      POSTGRES_PASSWORD: quotes
+    ports: ["5432:5432"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U spend -d spend"]
+      test: ["CMD-SHELL", "pg_isready -U quotes -d quotes"]
       interval: 5s
       timeout: 3s
       retries: 20
-
-  app:
-    build: .
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/spend
-      SPRING_DATASOURCE_USERNAME: spend
-      SPRING_DATASOURCE_PASSWORD: spend
-      SEED_COUNT: "2000000"
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-volumes:
-  pgdata:

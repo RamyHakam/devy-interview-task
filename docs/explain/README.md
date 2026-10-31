@@ -1,1 +1,0 @@
-Run the two SQL files with EXPLAIN (ANALYZE, BUFFERS) before/after indexes and save the raw outputs here. Do not fabricate measurements; the exact timings depend on reviewer hardware.

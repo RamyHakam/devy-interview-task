@@ -1,81 +1,74 @@
-# Fast and Correct Spend Report API
+# Idempotent Quote-to-Order Core
+
+Java 21 / Spring Boot 3 service for price-locked quotes, exactly-once confirmation, stock-safe order creation, an auditable approval gate, and human review.
 
 ## Approach
 
-Kotlin 2.2 + Spring Boot 3.5 + PostgreSQL 17. Money is stored exclusively as `BIGINT` minor units.
-
-The report endpoint uses plain SQL with dynamic, whitelisted grouping dimensions. Date ranges are half-open (`from <= occurred_at < to`) so adjacent reports do not overlap.
-
-Transactions use keyset pagination:
-`ORDER BY occurred_at DESC, id DESC` and `(occurred_at,id) < (:cursorAt,:cursorId)`. There is no OFFSET.
-
-Indexes:
-- `(customer_id, occurred_at DESC, id DESC)` supports the dominant report date scan and transaction pagination.
-- `(customer_id, category, occurred_at DESC, id DESC)` supports category-filtered reports.
-- `(customer_id, team_id)` supports team-oriented filtering/join access.
-
-The seed creates 50 customers and 10 teams per customer and intentionally puts 80% of transactions on customer 1.
-
-The cache is in-process with a 30-second TTL. The key contains customer, time range, grouping and category. A per-key `ReentrantLock` provides single-flight behavior: concurrent misses for the same key perform one database query. Writes invalidate all report entries belonging only to the affected customer.
+- Modular boundaries: HTTP API, application service, domain policy, persistence, and observability packages.
+- Quotes snapshot unit prices and line totals at creation; expiry is fixed at 15 minutes.
+- Confirmation serializes a given idempotency key with a PostgreSQL row lock. The request hash rejects key reuse with a changed payload.
+- A unique constraint on `orders.quote_id` is a second line of defense against duplicate conversion of one quote.
+- Stock is decremented using a conditional SQL update (`stock_quantity >= requested`) in the same transaction. PostgreSQL row-level write locking prevents overselling across competing quotes.
+- Policy is a pure domain function: threshold or credit-limit breach means `PENDING_REVIEW`; otherwise `APPROVED`.
+- Audit records capture actor, action, inputs, result, and timestamp. A database trigger rejects UPDATE and DELETE, not merely an application convention.
+- Metrics are exposed through Actuator (`/actuator/metrics` and `/actuator/prometheus`); `/actuator/health` is the health endpoint.
 
 ## Trade-offs
 
-Indexes improve reads but increase INSERT cost and storage. The composite indexes were chosen around the report and keyset access patterns rather than indexing every column.
-
-The cache favors latency while keeping correctness through customer-scoped invalidation after a committed insert. If cache state is lost, requests simply query PostgreSQL again. If PostgreSQL is slow, requests wait on the database; cache hits remain available until TTL expiry.
-
-For several service instances, an in-process cache would no longer be globally coherent. I would use a distributed cache plus versioned/customer-scoped invalidation, or publish invalidation events. At 100x the data, I would consider read replicas for report traffic and a pre-aggregated monthly/customer/team/category table maintained transactionally or asynchronously, depending on freshness requirements.
-
-## Measurements
-
-Run the simple query and optimized query plans against the seeded database and save them under `docs/explain/`. The repository is structured so reviewer-generated plans remain reproducible on the same hardware.
-
-Example:
-
-```bash
-docker compose up --build
-docker compose exec postgres psql -U spend -d spend
-```
-
-Then run the SQL in `docs/explain/before.sql` and `docs/explain/after.sql` with `EXPLAIN (ANALYZE, BUFFERS)` and redirect output to the corresponding `.txt` files.
-
-Run the load test:
-
-```bash
-chmod +x load-test.sh
-./load-test.sh
-```
-
-Record separate runs for customer 1 (large) and customer 50 (small) before and after indexing/cache warmup in `docs/load-results.md`.
+The service is designed to be carved out incrementally rather than via a big-bang cutover.
+1. Start by importing customer, SKU, price, and stock reference data from the legacy CRM.
+2. Run quote creation in shadow mode while the CRM remains authoritative.
+3. Compare generated totals and expiry decisions against legacy quotes and reconcile discrepancies.
+4. Route a small, explicitly selected sales cohort to this service for new quotes.
+5. Keep a stable quote/order identifier mapping in the integration layer.
+6. During the pilot, publish completed orders back to the CRM through an adapter.
+7. Expand traffic by customer segment or product family, with a feature-flagged rollback to legacy quote creation.
+8. Move order confirmation ownership only after stock and financial reconciliation is proven.
+9. Use an outbox table and stream publisher next so order events are delivered reliably.
+10. Add alerting for stock conflicts, approval backlog, latency, and idempotency anomalies.
+11. Add per-actor/customer rate limits, authentication, authorization, and secrets management.
+12. Add reconciliation jobs, operational dashboards, retention policies, and disaster-recovery exercises.
 
 ## AI usage
 
-AI assistance was used to accelerate boilerplate generation and review of the implementation. Database access patterns, index choices, cache consistency rules, and correctness constraints should be validated by running the supplied tests and PostgreSQL execution plans locally.
+No LLM is called. AI agents are ordinary API clients and identify themselves through `actorId` on confirmation. The actor is recorded in the audit trail. Human review requires a reviewer name and reason. Any AI-generated recommendation remains subject to the deterministic policy gate.
 
 ## How to run
 
-Requirements: Docker and Docker Compose.
+Requirements: Java 21, Maven 3.9+, and Docker.
 
 ```bash
-docker compose up --build
+docker compose up -d postgres
+mvn test
+mvn spring-boot:run
 ```
 
-The application waits for PostgreSQL, Flyway applies migrations, and the seed command generates at least 2 million transactions.
+The integration tests use Testcontainers and start an isolated real PostgreSQL instance; Docker must be available. The application uses the Compose PostgreSQL database by default.
 
-API examples:
+Create a quote:
 
 ```bash
-curl 'http://localhost:8080/customers/1/reports/spend?from=2025-01-01T00:00:00Z&to=2027-01-01T00:00:00Z&group_by=team,category,month'
+curl -s http://localhost:8080/quotes -H 'Content-Type: application/json' \
+  -d '{"customerId":1,"items":[{"sku":"STEEL-PLATE-10","quantity":2}]}'
 ```
+
+Confirm it (replace the UUID):
 
 ```bash
-curl 'http://localhost:8080/customers/1/transactions?limit=100'
+curl -s http://localhost:8080/quotes/QUOTE_UUID/confirm \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: sales-req-001' \
+  -d '{"actorId":"ai-agent:devy"}'
 ```
+
+Review an order:
 
 ```bash
-curl -X POST 'http://localhost:8080/customers/1/transactions' \
-  -H 'Content-Type: application/json' \
-  -d '{"teamId":1,"category":"software","amount":1299,"currency":"EUR","occurredAt":"2026-10-28T10:00:00Z"}'
+curl -s http://localhost:8080/orders/ORDER_UUID/review -H 'Content-Type: application/json' \
+  -d '{"decision":"approve","reviewer":"jane.doe","reason":"Credit and pricing verified"}'
 ```
 
-The implementation deliberately keeps the API small and has no authentication or UI, as required by the task.
+Read its audit history at `GET /orders/{id}/audit`. Seed customers are IDs `1` and `2`; seeded SKUs are `STEEL-PLATE-10`, `COPPER-WIRE-5`, and `BOLT-M12`. Configure `APPROVAL_THRESHOLD`, `DB_URL`, `DB_USER`, and `DB_PASSWORD` through environment variables.
+
+## Scope exclusions
+
+Authentication/authorization, UI, payments, logistics, external CRM integration, and real AI/LLM calls are intentionally not implemented. In production, actor identity must be authenticated rather than trusted from request bodies.
